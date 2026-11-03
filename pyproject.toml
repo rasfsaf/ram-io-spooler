@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ram-io-spooler"
+version = "1.0.0"
+description = "High-performance two-tier RAM Write-Behind Scribe Engine with write coalescing, LBA elevator sorting, and zero-leak eviction for mechanical HDDs."
+readme = "README.md"
+authors = [{ name = "rasfsaf" }]
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: System :: Hardware :: Symmetric Multi-processing",
+    "Topic :: Database :: Database Engines/Servers"
+]
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+ram-spooler = "spooler.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["spooler*"]

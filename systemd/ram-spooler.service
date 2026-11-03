@@ -1,0 +1,21 @@
+[Unit]
+Description=RAM Write-Behind Spooler Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 -m spooler.server --socket /run/ram-spooler.sock --host 127.0.0.1 --port 8920
+Restart=always
+RestartSec=3
+KillMode=process
+StandardOutput=journal
+StandardError=journal
+
+# Security sandbox
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/dev/shm /run /var/log /home
+
+[Install]
+WantedBy=multi-user.target
