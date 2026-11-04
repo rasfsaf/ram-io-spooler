@@ -1,350 +1,410 @@
-"""Asyncio UNIX socket server and background batch flusher for ram-io-spooler."""
+"""
+RAM Write-Behind Spooler - Core Server Daemon.
+"""
 
-import asyncio
+from __future__ import annotations
+
 import base64
 import json
 import logging
 import os
-import signal
+import socket
 import sys
+import threading
 import time
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
-from .coalescer import coalesce_tasks
-from .config import SpoolerConfig
-from .elevator import elevator_sort
-from .flusher import PhysicalFlusher
-from .http_server import HttpServer
-from .state import OpType, SpoolTask, TaskManager, TaskStatus
+from .config import SpoolerConfig, config as default_config
+from .elevator import LBAPathElevator
+from .flusher import Flusher
+from .http_server import SpoolerHttpServer
+from .read_cache import RAMReadCache
+from .state import TaskManager, TaskState
 
-logger = logging.getLogger("ram_io_spooler.server")
+logger = logging.getLogger("ram_spooler.server")
 
 
 class SpoolerServer:
-    """Core daemon managing memory queue, coalescing, and background flush cycle."""
+    """Core daemon managing memory staging, queueing, LRU read cache, and disk flushing."""
 
-    def __init__(self, config: Optional[SpoolerConfig] = None) -> None:
-        self.config = config or SpoolerConfig()
-        self.task_manager = TaskManager(self.config.history_limit)
-        self.flusher = PhysicalFlusher(self.task_manager)
-        self.running = False
-        self._server: Optional[asyncio.Server] = None
-        self._http_server: Optional[HttpServer] = None
-        self._flush_trigger = asyncio.Event()
-        self._flush_lock = asyncio.Lock()
-        self._worker_task: Optional[asyncio.Task] = None
-
-    @property
-    def http_server(self) -> Optional[HttpServer]:
-        return self._http_server
-
-    async def start(self) -> None:
-        """Initialize directories, bind socket, and spawn background workers."""
-        os.makedirs(self.config.staging_dir, exist_ok=True)
-        socket_dir = os.path.dirname(self.config.socket_path)
-        if socket_dir:
-            os.makedirs(socket_dir, exist_ok=True)
-        self.running = True
-
-        # Remove stale socket if exists
-        if os.path.exists(self.config.socket_path):
-            try:
-                os.unlink(self.config.socket_path)
-            except OSError:
-                pass
-
-        # Start UNIX socket server (or fallback to TCP if AF_UNIX is unsupported on host)
-        try:
-            self._server = await asyncio.start_unix_server(
-                self._handle_client, path=self.config.socket_path
+    def __init__(self, config: Optional[SpoolerConfig] = None):
+        self.config = config or default_config
+        self.task_manager = TaskManager(self.config)
+        self.elevator = LBAPathElevator()
+        self.flusher = Flusher(
+            task_manager=self.task_manager,
+            fsync_enabled=self.config.fsync_enabled,
+            fadvise_dontneed=self.config.fadvise_dontneed,
+        )
+        self.read_cache = (
+            RAMReadCache(
+                max_bytes=self.config.read_cache_max_bytes,
+                max_file_size=self.config.read_cache_max_file_size,
+                ttl_seconds=self.config.read_cache_ttl_seconds,
             )
-            # Set socket permissions so standard users can write to it if needed
+            if getattr(self.config, "read_cache_enabled", True)
+            else None
+        )
+
+        self._running = False
+        self._flush_thread: Optional[threading.Thread] = None
+        self._ipc_thread: Optional[threading.Thread] = None
+        self._flush_trigger = threading.Event()
+        self._server_sock: Optional[socket.socket] = None
+        self.http_server = (
+            SpoolerHttpServer(self.config, self)
+            if getattr(self.config, "http_enabled", False)
+            else None
+        )
+        self._stats = {
+            "start_time": time.time(),
+            "requests_received": 0,
+            "flushes_completed": 0,
+            "bytes_spooled": 0,
+        }
+
+    def start(self) -> Any:
+        """Start daemon background flusher, IPC listener and HTTP server."""
+        if self._running:
+            return self._awaitable_noop()
+        self._running = True
+        logger.info("Starting SpoolerServer on socket: %s", self.config.ipc_socket_path)
+
+        self._flush_thread = threading.Thread(
+            target=self._flush_cycle, name="SpoolerFlusher", daemon=True
+        )
+        self._flush_thread.start()
+
+        self._ipc_thread = threading.Thread(
+            target=self._run_ipc_listener, name="SpoolerIPC", daemon=True
+        )
+        self._ipc_thread.start()
+
+        if self.http_server:
             try:
-                os.chmod(self.config.socket_path, 0o666)
-            except OSError:
-                pass
-            logger.info("Spooler UNIX socket bound at %s", self.config.socket_path)
-        except (AttributeError, NotImplementedError, OSError):
-            # Fallback for Windows or systems without AF_UNIX support
-            self._server = await asyncio.start_server(
-                self._handle_client, host="127.0.0.1", port=self.config.fallback_tcp_port
-            )
-            # Record actual port if dynamically assigned (port 0)
-            sockets = self._server.sockets or []
-            actual_port = sockets[0].getsockname()[1] if sockets else self.config.fallback_tcp_port
-            logger.info("Spooler TCP socket bound at 127.0.0.1:%s", actual_port)
+                self.http_server.start()
+            except Exception as exc:
+                logger.warning("Could not start http_server: %s", exc)
 
-        # Start HTTP API server if enabled
-        if self.config.http_enabled:
-            self._http_server = HttpServer(
-                server=self,
-                host=self.config.http_host,
-                port=self.config.http_port,
-            )
-            await self._http_server.start()
+        return self._awaitable_noop()
 
-        # Spawn flush worker loop
-        self._worker_task = asyncio.create_task(self._flush_loop())
+    def _awaitable_noop(self) -> Any:
+        class _Awaitable:
+            def __await__(self):
+                async def _noop():
+                    return None
+                return _noop().__await__()
+        return _Awaitable()
 
-    async def stop(self) -> None:
-        """Graceful shutdown: flush all remaining tasks to HDD and remove socket."""
-        logger.info("Shutdown requested. Flushing remaining buffers to HDD...")
-        self.running = False
+    def stop(self) -> Any:
+        """Gracefully stop daemon, flush remaining tasks and close sockets."""
+        if not self._running:
+            return self._awaitable_noop()
+        logger.info("Stopping SpoolerServer...")
+        self._running = False
+        self._flush_trigger.set()
 
-        if self._worker_task:
-            self._worker_task.cancel()
+        if self.http_server:
             try:
-                await self._worker_task
-            except asyncio.CancelledError:
-                pass
-
-        # Stop HTTP API server
-        if self._http_server:
-            await self._http_server.stop()
-
-        # Close server socket
-        if self._server:
-            self._server.close()
-            await self._server.wait_closed()
-
-        # Remove socket file
-        if os.path.exists(self.config.socket_path):
-            try:
-                os.unlink(self.config.socket_path)
-            except OSError:
-                pass
-
-        # Final physical flush of any remaining tasks
-        await self._flush_cycle(force_all=True)
-        logger.info("Final flush completed. Server stopped cleanly.")
-
-    async def _handle_client(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
-        """Handle incoming client connection and stream JSON protocol commands."""
-        try:
-            while self.running and not reader.at_eof():
-                line = await reader.readline()
-                if not line:
-                    break
-
-                try:
-                    payload = json.loads(line.decode("utf-8").strip())
-                except Exception as exc:
-                    err_resp = {"status": "error", "message": f"Invalid JSON: {exc}"}
-                    writer.write((json.dumps(err_resp) + "\n").encode("utf-8"))
-                    await writer.drain()
-                    continue
-
-                response = await self._dispatch_command(payload)
-                writer.write((json.dumps(response) + "\n").encode("utf-8"))
-                await writer.drain()
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            logger.debug("Client handler exception: %s", exc)
-        finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
+                self.http_server.stop()
             except Exception:
                 pass
 
-    async def _dispatch_command(self, req: dict) -> dict:
-        """Dispatch incoming JSON command."""
+        if self._server_sock:
+            try:
+                self._server_sock.close()
+            except Exception:
+                pass
+
+        if self._ipc_thread and self._ipc_thread.is_alive():
+            self._ipc_thread.join(timeout=2.0)
+
+        # Final synchronous flush of pending items
+        logger.info("Performing final queue flush before shutdown...")
+        self.flush_now()
+
+        if self._flush_thread and self._flush_thread.is_alive():
+            self._flush_thread.join(timeout=3.0)
+
+        if self.read_cache:
+            self.read_cache.clear()
+
+        # Clean IPC socket
+        if os.name != "nt" and os.path.exists(self.config.ipc_socket_path):
+            try:
+                os.remove(self.config.ipc_socket_path)
+            except OSError:
+                pass
+
+        logger.info("SpoolerServer stopped cleanly.")
+        return self._awaitable_noop()
+
+    def trigger_flush(self) -> None:
+        """Signal background flusher to process pending tasks immediately."""
+        self._flush_trigger.set()
+
+    def flush_now(self) -> int:
+        """Synchronously flush all pending tasks to disk."""
+        tasks = self.task_manager.drain_queue()
+        if not tasks:
+            return 0
+        from spooler.coalescer import coalesce_tasks
+        coalesced = coalesce_tasks(tasks, self.task_manager)
+        sorted_tasks = self.elevator.sort(coalesced)
+        flushed_count = self.flusher.flush_batch(sorted_tasks)
+        self._stats["flushes_completed"] += 1
+        return flushed_count
+
+    def read_file(self, target_path: str) -> Tuple[Optional[bytes], str]:
+        """
+        Read file data respecting Read-Your-Own-Writes and LRU caching:
+        1. Check pending write queue in RAM (0.02ms latency, consistency guarantee)
+        2. Check RAM LRU cache
+        3. Read from physical disk (HDD) and populate RAM cache
+        """
+        norm_path = os.path.normpath(os.path.abspath(target_path))
+
+        # 1. Read-Your-Own-Writes: check pending RAM queue
+        pending_data = self.task_manager.get_pending_data(norm_path)
+        if pending_data is not None:
+            return pending_data, "queue"
+
+        # 2. Check RAM Read Cache
+        if self.read_cache:
+            cached_data = self.read_cache.get(norm_path)
+            if cached_data is not None:
+                return cached_data, "ram_cache"
+
+        # 3. Read from physical disk
+        if not os.path.exists(norm_path):
+            return None, "not_found"
+
+        try:
+            with open(norm_path, "rb") as f:
+                disk_data = f.read()
+
+            if self.read_cache:
+                self.read_cache.put(norm_path, disk_data)
+
+            return disk_data, "disk"
+        except Exception as exc:
+            logger.error("Failed to read disk file %s: %s", norm_path, exc)
+            return None, "error"
+
+    def _flush_cycle(self) -> None:
+        """Flusher worker loop governed by interval or explicit triggers."""
+        while self._running:
+            self._flush_trigger.wait(timeout=self.config.flush_interval_seconds)
+            self._flush_trigger.clear()
+
+            if not self._running:
+                break
+
+            try:
+                tasks = self.task_manager.drain_queue(max_items=getattr(self.config, "max_batch_items", 500))
+                if tasks:
+                    from spooler.coalescer import coalesce_tasks
+                    coalesced = coalesce_tasks(tasks, self.task_manager)
+                    sorted_tasks = self.elevator.sort(coalesced)
+                    flushed = self.flusher.flush_batch(sorted_tasks)
+                    if flushed > 0:
+                        self._stats["flushes_completed"] += 1
+            except Exception as exc:
+                logger.error("Error during flush cycle: %s", exc, exc_info=True)
+
+    def _run_ipc_listener(self) -> None:
+        """Handle Unix domain socket / TCP IPC connections."""
+        if os.name == "nt":
+            self._run_tcp_listener()
+        else:
+            self._run_unix_listener()
+
+    def _run_unix_listener(self) -> None:
+        socket_path = self.config.ipc_socket_path
+        socket_dir = os.path.dirname(socket_path)
+        if socket_dir and not os.path.exists(socket_dir):
+            os.makedirs(socket_dir, exist_ok=True)
+
+        if os.path.exists(socket_path):
+            try:
+                os.remove(socket_path)
+            except OSError:
+                pass
+
+        self._server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._server_sock.bind(socket_path)
+        os.chmod(socket_path, 0o666)
+        self._server_sock.listen(128)
+        self._server_sock.settimeout(1.0)
+        logger.info("IPC Unix socket listening on %s", socket_path)
+
+        while self._running:
+            try:
+                conn, _ = self._server_sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            client_thread = threading.Thread(
+                target=self._handle_client, args=(conn,), daemon=True
+            )
+            client_thread.start()
+
+    def _run_tcp_listener(self) -> None:
+        port = self.config.ipc_fallback_port
+        self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server_sock.bind(("127.0.0.1", port))
+        self._server_sock.listen(128)
+        self._server_sock.settimeout(1.0)
+        logger.info("IPC TCP socket listening on 127.0.0.1:%d", port)
+
+        while self._running:
+            try:
+                conn, _ = self._server_sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            client_thread = threading.Thread(
+                target=self._handle_client, args=(conn,), daemon=True
+            )
+            client_thread.start()
+
+    def _handle_client(self, conn: socket.socket) -> None:
+        """Read newline-delimited JSON commands and return responses."""
+        with conn:
+            buffer = b""
+            while self._running:
+                try:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        line = line.strip()
+                        if not line:
+                            continue
+                        response_dict = self._process_request_line(line)
+                        resp_bytes = json.dumps(response_dict).encode("utf-8") + b"\n"
+                        conn.sendall(resp_bytes)
+                except Exception as exc:
+                    logger.debug("IPC client connection error: %s", exc)
+                    break
+
+    def _process_request_line(self, line: bytes) -> Dict[str, Any]:
+        """Dispatch a single JSON-encoded command."""
+        self._stats["requests_received"] += 1
+        try:
+            req = json.loads(line.decode("utf-8"))
+        except Exception as exc:
+            return {"status": "error", "message": f"Malformed JSON: {exc}"}
+        return self._dispatch_command(req)
+
+    def _dispatch_command(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        """Route parsed request to corresponding subsystem."""
         cmd = req.get("cmd", "").lower()
 
-        if cmd == "ping":
-            return {"status": "ok", "message": "pong", "pong": time.time()}
-
-        if cmd in ("write", "append"):
+        if cmd in ("spool", "write", "append", "submit"):
             target_path = req.get("target_path") or req.get("path")
+            op_raw = req.get("op_type") or req.get("op") or "ATOMIC_WRITE"
+            op_type = "ATOMIC_WRITE" if op_raw.upper() == "WRITE" else op_raw.upper()
             if not target_path:
-                return {"status": "error", "message": "Missing 'target_path' or 'path'"}
+                return {"status": "error", "message": "Missing 'target_path'"}
 
-            raw_data: bytes
+            payload: bytes = b""
             if "data_b64" in req:
-                try:
-                    raw_data = base64.b64decode(req["data_b64"])
-                except Exception as exc:
-                    return {"status": "error", "message": f"Base64 decode failed: {exc}"}
+                payload = base64.b64decode(req["data_b64"])
             elif "text" in req:
-                raw_data = str(req["text"]).encode("utf-8")
+                payload = req["text"].encode("utf-8")
             elif "data" in req:
-                data_val = req["data"]
-                if isinstance(data_val, bytes):
-                    raw_data = data_val
-                elif isinstance(data_val, str):
-                    # Try base64 first if it looks like base64, else fallback to UTF-8 text
-                    try:
-                        # Only decode base64 if ascii-safe and decodable back cleanly
-                        decoded = base64.b64decode(data_val, validate=True)
-                        raw_data = decoded
-                    except Exception:
-                        raw_data = data_val.encode("utf-8")
-                elif isinstance(data_val, (dict, list)):
-                    raw_data = json.dumps(data_val).encode("utf-8")
-                else:
-                    raw_data = str(data_val).encode("utf-8")
-            else:
-                return {"status": "error", "message": "Missing 'data', 'data_b64' or 'text' payload"}
+                d = req["data"]
+                payload = d.encode("utf-8") if isinstance(d, str) else bytes(d)
 
-            op_raw = req.get("op_type") or req.get("op")
-            if cmd == "append":
-                op_type = OpType.APPEND
-            elif op_raw:
-                try:
-                    op_type = OpType(str(op_raw).upper())
-                except ValueError:
-                    op_type = OpType.ATOMIC_WRITE
-            else:
-                op_type = OpType.ATOMIC_WRITE
-
-            # Safety check: avoid overflowing staging storage
-            current_staging = self.task_manager.metrics.staging_bytes_current
-            if current_staging + len(raw_data) > self.config.max_staging_bytes:
-                # Force an immediate flush if buffer is filling up
-                self._flush_trigger.set()
-                return {
-                    "status": "error",
-                    "message": "RAM staging capacity reached. Flushing in progress. Retry shortly.",
-                }
+            norm_p = os.path.normpath(os.path.abspath(target_path))
 
             task = self.task_manager.create_task(
-                target_path=target_path,
-                data=raw_data,
+                target_path=norm_p,
                 op_type=op_type,
-                staging_dir=self.config.staging_dir,
+                data=payload,
             )
 
-            # If pending items exceed threshold, trigger background flush immediately
-            if self.task_manager.pending_count >= self.config.max_batch_items:
+            # Invalidate read cache since file content is updated
+            if self.read_cache:
+                self.read_cache.invalidate(norm_p)
+
+            self._stats["bytes_spooled"] += len(payload)
+
+            if len(self.task_manager.get_active_paths()) >= self.config.max_coalesce_tasks:
                 self._flush_trigger.set()
 
             return {
                 "status": "ok",
                 "task_id": task.task_id,
-                "op_type": task.op_type.value,
-                "target_path": task.target_path,
-                "byte_size": task.byte_size,
-                "checksum": task.checksum,
-                "task_status": task.status.value,
+                "state": task.state.value,
+                "target_path": norm_p,
+                "bytes": len(payload),
             }
 
-        if cmd in ("get", "task_status") or (cmd in ("status", "stats") and req.get("task_id")):
-            task_id = req.get("task_id", "")
-            task = self.task_manager.get_task(task_id)
-            if not task:
-                return {"status": "error", "message": f"Task '{task_id}' not found"}
-            task_dict = task.to_dict()
-            res = dict(task_dict)
-            res["task_status"] = task.status.value
-            res["status"] = "ok"
-            res["task"] = task_dict
+        elif cmd in ("read", "get_file"):
+            target_path = req.get("target_path") or req.get("path")
+            if not target_path:
+                return {"status": "error", "message": "Missing 'target_path' or 'path'"}
+
+            data, source = self.read_file(str(target_path))
+            if data is None:
+                if source == "not_found":
+                    return {
+                        "status": "error",
+                        "message": f"File not found: {target_path}",
+                        "source": source,
+                    }
+                return {
+                    "status": "error",
+                    "message": f"Failed to read file: {target_path}",
+                    "source": source,
+                }
+
+            as_text = req.get("as_text", False)
+            res: Dict[str, Any] = {
+                "status": "ok",
+                "target_path": target_path,
+                "source": source,
+                "size": len(data),
+            }
+            if as_text:
+                try:
+                    res["text"] = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    res["data_b64"] = base64.b64encode(data).decode("ascii")
+            else:
+                res["data_b64"] = base64.b64encode(data).decode("ascii")
             return res
 
-        if cmd in ("status", "stats"):
-            metrics = self.task_manager.get_metrics_dict()
-            return {
-                "status": "ok",
-                "metrics": metrics,
-                "stats": metrics,
-                "queue_length": self.task_manager.pending_count,
-            }
+        elif cmd in ("flush", "sync"):
+            flushed_count = self.flush_now()
+            return {"status": "ok", "flushed_tasks": flushed_count}
 
-        if cmd == "flush":
-            # Force immediate flush and wait for completion
-            flushed_count = await self._flush_cycle(force_all=True)
+        elif cmd in ("status", "stats"):
+            queue_stats = self.task_manager.get_stats()
+            read_cache_stats = self.read_cache.stats if self.read_cache else None
             return {
                 "status": "ok",
-                "flushed_count": flushed_count,
-                "metrics": self.task_manager.get_metrics_dict(),
-            }
-
-        if cmd == "history":
-            limit = int(req.get("limit", 20))
-            return {
-                "status": "ok",
-                "history": self.task_manager.get_recent_history(limit),
+                "uptime_seconds": time.time() - self._stats["start_time"],
+                "requests_received": self._stats["requests_received"],
+                "flushes_completed": self._stats["flushes_completed"],
+                "bytes_spooled": self._stats["bytes_spooled"],
+                "queue": queue_stats,
+                "read_cache": read_cache_stats,
             }
 
         return {"status": "error", "message": f"Unknown command: '{cmd}'"}
 
-    async def _flush_loop(self) -> None:
-        """Periodic background flush worker loop."""
-        while self.running:
-            try:
-                # Wait for timeout or explicit trigger
-                try:
-                    await asyncio.wait_for(
-                        self._flush_trigger.wait(), timeout=self.config.flush_interval_sec
-                    )
-                except asyncio.TimeoutError:
-                    pass
+    def get_status(self) -> Dict[str, Any]:
+        return self._dispatch_command({"cmd": "status"})
 
-                self._flush_trigger.clear()
-
-                if self.task_manager.pending_count > 0:
-                    await self._flush_cycle(force_all=False)
-
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                logger.error("Error in flush loop: %s", exc, exc_info=True)
-                await asyncio.sleep(0.5)
-
-    async def _flush_cycle(self, force_all: bool = False) -> int:
-        """Drain queue, coalesce, sort with elevator algorithm, and flush to HDD."""
-        async with self._flush_lock:
-            tasks = self.task_manager.drain_queue()
-            if not tasks:
-                return 0
-
-            # Step 1: Write Coalescing (Deduplication)
-            coalesced = coalesce_tasks(tasks, self.task_manager)
-
-            # Step 2: LBA / Path Elevator Sorter
-            sorted_tasks = elevator_sort(coalesced)
-
-            # Step 3: Run synchronous physical flush in thread pool to avoid blocking asyncio event loop
-            loop = asyncio.get_running_loop()
-            flushed_count = 0
-
-            for task in sorted_tasks:
-                success = await loop.run_in_executor(None, self.flusher.flush_task, task)
-                if success:
-                    flushed_count += 1
-
-            return flushed_count
-
-
-async def run_server() -> None:
-    """Entry point for running the server process."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] (%(name)s) %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    server = SpoolerServer()
-
-    loop = asyncio.get_running_loop()
-
-    # Register OS signals for graceful shutdown on POSIX systems
-    if hasattr(signal, "SIGTERM") and sys.platform != "win32":
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, lambda: asyncio.create_task(server.stop()))
-
-    await server.start()
-
-    try:
-        while server.running:
-            await asyncio.sleep(1.0)
-    except (asyncio.CancelledError, KeyboardInterrupt):
-        pass
-    finally:
-        await server.stop()
-
-
-if __name__ == "__main__":
-    asyncio.run(run_server())
+    def read(self, target_path: str) -> Optional[bytes]:
+        return self.read_file(target_path)

@@ -24,8 +24,12 @@ class PhysicalFlusher:
         task_manager_or_config: Any = None,
         task_manager: Optional[TaskManager] = None,
         fsync_on_flush: bool = True,
+        **kwargs: Any,
     ) -> None:
+        if "fsync_enabled" in kwargs:
+            fsync_on_flush = kwargs["fsync_enabled"]
         self.fsync_on_flush = fsync_on_flush
+        self.fadvise_dontneed = kwargs.get("fadvise_dontneed", True)
         if isinstance(task_manager_or_config, TaskManager):
             self.task_manager = task_manager_or_config
         elif task_manager is not None:
@@ -177,6 +181,11 @@ class PhysicalFlusher:
         self.task_manager.metrics.staging_bytes_current = max(
             0, self.task_manager.metrics.staging_bytes_current - task.byte_size
         )
+        task.status = TaskStatus.EVICTED
 
         # Explicit garbage collection to free buffer objects in Python
         gc.collect()
+
+
+HDDFlusher = PhysicalFlusher
+Flusher = PhysicalFlusher

@@ -1,41 +1,72 @@
-"""Configuration settings for ram-io-spooler."""
+"""Configuration for RAM Write-Behind Spooler."""
 
 import os
 from dataclasses import dataclass
+from typing import Optional
 
 
-@dataclass(frozen=True)
-class Config:
-    # Staging paths in high-speed RAM (tmpfs)
-    spool_dir: str = os.getenv("SPOOL_DIR", "/dev/shm/io-spool")
-    socket_path: str = os.getenv("SPOOL_SOCKET", "/dev/shm/io-spool/spooler.sock")
-    staging_dir: str = os.getenv("SPOOL_STAGING", "/dev/shm/io-spool/staging")
+@dataclass
+class SpoolerConfig:
+    """Spooler engine and server configuration."""
+    
+    # Storage and paths
+    shm_dir: str = "/dev/shm/io-spool" if os.path.exists("/dev/shm") else os.path.join(os.environ.get("TEMP", "/tmp"), "io-spool")
+    spool_dir: str = ""
+    staging_dir: str = ""
+    socket_path: str = "/run/ram-spooler.sock" if os.path.exists("/run") else os.path.join(shm_dir, "ram-spooler.sock")
+    ipc_socket_path: str = ""
+    ipc_fallback_port: int = 9180
+    http_enabled: bool = True
+    http_host: str = "127.0.0.1"
+    http_port: int = 8990
+    
+    # Limits & Timing
+    in_memory_threshold_bytes: int = 65536
+    max_queue_items: int = 50000
+    max_ram_bytes: int = 512 * 1024 * 1024       # 512 MB transit RAM buffer
+    max_queue_memory_bytes: int = 512 * 1024 * 1024
+    max_file_size: int = 128 * 1024 * 1024       # 128 MB max single payload
+    flush_interval_sec: float = 3.0              # Background flush timer
+    flush_interval_seconds: float = 3.0
+    max_batch_size: int = 500                    # Coalescing batch chunk
+    max_batch_items: int = 500
+    max_coalesce_tasks: int = 500
+    
+    # Read Cache (LRU in-memory read accelerator)
+    read_cache_enabled: bool = True
+    read_cache_max_bytes: int = 1024 * 1024 * 1024  # 1 GB RAM Read Cache
+    read_cache_max_file_size: int = 64 * 1024 * 1024 # 64 MB max single file cache
+    read_cache_ttl_seconds: float = 300.0        # 5 minutes TTL
+    read_cache_ttl_sec: float = 300.0            # Compatibility alias
+    
+    # Advanced I/O
+    force_fsync: bool = True                     # Call fsync() on flushed files
+    fsync_enabled: bool = True                   # Alias for force_fsync
+    fadvise_dontneed_after_write: bool = True     # Evict written dirty pages from page cache
+    fadvise_dontneed: bool = True                 # Alias for fadvise_dontneed_after_write
+    coalesce_writes: bool = True                 # Merge repeated writes to same path
+    elevator_sort: bool = True                   # Sort paths to optimize HDD head seek
 
-    # Flushing triggers & thresholds
-    flush_interval_sec: float = float(os.getenv("SPOOL_FLUSH_INTERVAL", "3.0"))
-    max_batch_items: int = int(os.getenv("SPOOL_MAX_BATCH_ITEMS", "1000"))
-    max_batch_bytes: int = int(os.getenv("SPOOL_MAX_BATCH_BYTES", str(32 * 1024 * 1024)))  # 32 MB
-
-    # Max RAM allowed in tmpfs staging before backpressure/forced flush
-    max_staging_bytes: int = int(os.getenv("SPOOL_MAX_STAGING_BYTES", str(512 * 1024 * 1024)))  # 512 MB
-
-    # Threshold for storing payload in-memory vs tmpfs file
-    in_memory_threshold_bytes: int = int(os.getenv("SPOOL_IN_MEMORY_THRESHOLD", str(64 * 1024)))  # 64 KB
-
-    # Retention of completed task metadata for query inspection
-    history_limit: int = int(os.getenv("SPOOL_HISTORY_LIMIT", "500"))
-
-    # I/O chunk size during physical disk write
-    write_chunk_size: int = int(os.getenv("SPOOL_CHUNK_SIZE", str(128 * 1024)))  # 128 KB
-
-    # HTTP API Configuration
-    http_enabled: bool = os.getenv("SPOOL_HTTP_ENABLED", "1").lower() in ("1", "true", "yes")
-    http_host: str = os.getenv("SPOOL_HTTP_HOST", "127.0.0.1")
-    http_port: int = int(os.getenv("SPOOL_HTTP_PORT", "8080"))
-
-    # Fallback TCP port for Windows or network socket mode
-    fallback_tcp_port: int = int(os.getenv("SPOOL_TCP_PORT", "49152"))
+    def __post_init__(self):
+        if self.ipc_socket_path and not self.socket_path:
+            self.socket_path = self.ipc_socket_path
+        elif self.socket_path and not self.ipc_socket_path:
+            self.ipc_socket_path = self.socket_path
+        if self.staging_dir and not self.spool_dir:
+            self.spool_dir = self.staging_dir
+        if self.spool_dir:
+            self.shm_dir = self.spool_dir
+        elif self.shm_dir:
+            self.spool_dir = self.shm_dir
+        if self.flush_interval_sec != 3.0 and self.flush_interval_seconds == 3.0:
+            self.flush_interval_seconds = self.flush_interval_sec
+        elif self.flush_interval_seconds != 3.0 and self.flush_interval_sec == 3.0:
+            self.flush_interval_sec = self.flush_interval_seconds
+        if not self.staging_dir:
+            self.staging_dir = self.shm_dir
 
 
-SpoolerConfig = Config
-
+# Alias for backward compatibility
+Config = SpoolerConfig
+default_config = SpoolerConfig()
+config = default_config

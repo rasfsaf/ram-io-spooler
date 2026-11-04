@@ -2,12 +2,16 @@
 
 import hashlib
 import os
+import threading
 import time
 import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Deque, Dict, List, Optional
+from spooler.config import SpoolerConfig
+
+default_config = SpoolerConfig()
 
 
 class OpType(str, Enum):
@@ -23,6 +27,10 @@ class TaskStatus(str, Enum):
     SYNCED = "SYNCED"
     EVICTED = "EVICTED"
     FAILED = "FAILED"
+
+TaskState = TaskStatus
+SpoolState = TaskStatus
+SpoolOpType = OpType
 
 
 @dataclass
@@ -80,7 +88,7 @@ class SpoolerMetrics:
 class TaskManager:
     """Manages active queues, state transitions, and completed task history."""
 
-    def __init__(self, config_or_limit: Any = 500) -> None:
+    def __init__(self, config_or_limit: Any = 500, *args: Any, **kwargs: Any) -> None:
         if hasattr(config_or_limit, "history_limit"):
             self.history_limit = config_or_limit.history_limit
             self.config = config_or_limit
@@ -95,6 +103,8 @@ class TaskManager:
         self.history: Deque[SpoolTask] = deque(maxlen=self.history_limit)
         self.metrics = SpoolerMetrics()
         self.tasks_by_id: Dict[str, SpoolTask] = {}
+        self._lock = threading.Lock()
+        self.lock = self._lock
 
     def enqueue(
         self,
@@ -109,8 +119,23 @@ class TaskManager:
         checksum = hashlib.sha256(data).hexdigest()
         byte_size = len(data)
 
-        staging_path = staging_dir or (self.config.staging_dir if self.config else None)
-        threshold = self.config.in_memory_threshold_bytes if self.config else in_memory_threshold
+        staging_path = (
+            staging_dir
+            or getattr(self, "staging_dir", None)
+            or (getattr(self.config, "staging_dir", None) if self.config else None)
+            or (getattr(self.config, "shm_dir", None) if self.config else None)
+            or getattr(default_config, "staging_dir", None)
+            or getattr(default_config, "shm_dir", None)
+            or "/dev/shm/io-spool"
+        )
+        if in_memory_threshold is not None:
+            threshold = in_memory_threshold
+        elif self.config and hasattr(self.config, "in_memory_threshold_bytes"):
+            threshold = self.config.in_memory_threshold_bytes
+        elif hasattr(default_config, "in_memory_threshold_bytes"):
+            threshold = default_config.in_memory_threshold_bytes
+        else:
+            threshold = 65536
 
         staging_file: Optional[str] = None
         in_memory_data: Optional[bytes] = None
@@ -145,6 +170,62 @@ class TaskManager:
     def get_task(self, task_id: str) -> Optional[SpoolTask]:
         return self.tasks_by_id.get(task_id)
 
+    def get_pending_data(self, target_path: str) -> Optional[bytes]:
+        """
+        Inspect the active queue for unwritten modifications to target_path.
+        Implements Read-Your-Own-Writes consistency.
+        Returns the resolved bytes if pending data exists, or None.
+        """
+        norm_target = os.path.abspath(target_path)
+        matching_tasks = [
+            t for t in self.queue
+            if os.path.abspath(t.target_path) == norm_target and t.state in (SpoolState.QUEUED, SpoolState.COALESCED, SpoolState.FLUSHING)
+        ]
+        if not matching_tasks:
+            return None
+
+        # Helper to read payload
+        def read_payload(t: SpoolTask) -> bytes:
+            if t.in_memory_data is not None:
+                return t.in_memory_data
+            if t.staging_file and os.path.exists(t.staging_file):
+                try:
+                    with open(t.staging_file, "rb") as sf:
+                        return sf.read()
+                except OSError:
+                    return b""
+            return b""
+
+        # Check if the latest task is ATOMIC_WRITE or SQLITE_SYNC
+        # If so, it supersedes previous writes
+        last_idx = len(matching_tasks) - 1
+        last_atomic_idx = -1
+        for i in range(last_idx, -1, -1):
+            if matching_tasks[i].op_type in (SpoolOpType.ATOMIC_WRITE, SpoolOpType.SQLITE_SYNC):
+                last_atomic_idx = i
+                break
+
+        if last_atomic_idx != -1:
+            base_data = read_payload(matching_tasks[last_atomic_idx])
+            remaining = matching_tasks[last_atomic_idx + 1:]
+            for t in remaining:
+                if t.op_type == SpoolOpType.APPEND:
+                    base_data += read_payload(t)
+            return base_data
+
+        # If only APPEND tasks exist in queue, read base from disk (if exists) and append
+        base_data = b""
+        if os.path.exists(norm_target):
+            try:
+                with open(norm_target, "rb") as f:
+                    base_data = f.read()
+            except OSError:
+                base_data = b""
+        for t in matching_tasks:
+            if t.op_type == SpoolOpType.APPEND:
+                base_data += read_payload(t)
+        return base_data
+
     # Alias for server compatibility
     create_task = enqueue
 
@@ -152,15 +233,24 @@ class TaskManager:
     def pending_count(self) -> int:
         return len(self.queue)
 
+    def get_active_paths(self) -> List[str]:
+        with self.lock:
+            return list({t.target_path for t in self.queue})
+
+    def drain_queue(self, max_items: Optional[int] = None) -> List[SpoolTask]:
+        """Extract queued tasks for a flush cycle."""
+        with self.lock:
+            if max_items is None or max_items >= len(self.queue):
+                batch = self.queue
+                self.queue = []
+                return batch
+            batch = self.queue[:max_items]
+            self.queue = self.queue[max_items:]
+            return batch
+
     def extract_queue(self) -> List[SpoolTask]:
         """Extract all queued tasks for a flush cycle."""
-        batch = self.queue
-        self.queue = []
-        return batch
-
-    def drain_queue(self) -> List[SpoolTask]:
-        """Alias for extract_queue."""
-        return self.extract_queue()
+        return self.drain_queue()
 
     def requeue_tasks(self, tasks: List[SpoolTask]) -> None:
         """Put back tasks that failed or could not be processed immediately."""
@@ -177,3 +267,9 @@ class TaskManager:
     def get_metrics_dict(self) -> Dict[str, Any]:
         """Return metrics as a dictionary for status inspection."""
         return asdict(self.metrics)
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Return metrics and current queue size for status inspection."""
+        stats = self.get_metrics_dict()
+        stats["pending_tasks"] = len(self.queue)
+        return stats

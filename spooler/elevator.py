@@ -37,3 +37,29 @@ def elevator_sort(tasks: List[SpoolTask]) -> List[SpoolTask]:
         return tasks
 
     return sorted(tasks, key=_get_sort_key)
+
+
+class PathElevatorSorter:
+    @staticmethod
+    def sort(tasks: List[SpoolTask]) -> List[SpoolTask]:
+        return elevator_sort(tasks)
+
+    @staticmethod
+    def sort_paths(paths: List[str]) -> List[str]:
+        def _path_sort_key(p: str):
+            norm_path = os.path.abspath(p)
+            dirname = os.path.dirname(norm_path)
+            basename = os.path.basename(norm_path)
+            inode_num = 0
+            if os.path.exists(norm_path):
+                try:
+                    inode_num = os.stat(norm_path).st_ino
+                except OSError:
+                    inode_num = 0
+            drive, path_without_drive = os.path.splitdrive(norm_path)
+            path_components = [comp for comp in path_without_drive.split(os.sep) if comp]
+            return (drive, path_components[:-1], inode_num, basename)
+        return sorted(paths, key=_path_sort_key)
+
+
+LBAPathElevator = PathElevatorSorter
