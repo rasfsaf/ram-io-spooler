@@ -1,21 +1,26 @@
 [Unit]
-Description=RAM Write-Behind Spooler Daemon
-After=network.target
+Description=RAM Write-Behind Scribe & Read Cache Engine (ram-io-spooler)
+After=network.target local-fs.target
+Documentation=https://github.com/rasfsaf/ram-io-spooler
 
 [Service]
 Type=simple
-User=root
-ExecStart=/usr/bin/python3 -m spooler.server --socket /run/ram-spooler.sock --host 127.0.0.1 --port 8920
+User=server
+Group=server
+WorkingDirectory=/home/server/ram-io-spooler
+ExecStart=/usr/bin/python3 -m spooler server
+
+# Настройки объема ОЗУ (поддерживаются форматы: 512MB, 1GB, 2G, 2048M, байты):
+Environment="SPOOLER_READ_CACHE_SIZE=1GB"
+Environment="SPOOLER_WRITE_BUFFER_SIZE=512MB"
+
 Restart=always
 RestartSec=3
-KillMode=process
+
+# Системные лимиты
+LimitNOFILE=65536
 StandardOutput=journal
 StandardError=journal
-
-# Security sandbox
-ProtectSystem=full
-ProtectHome=read-only
-ReadWritePaths=/dev/shm /run /var/log /home
 
 [Install]
 WantedBy=multi-user.target

@@ -111,12 +111,37 @@ def cmd_history(client: SpoolerClient, args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_read(client: SpoolerClient, args: argparse.Namespace) -> int:
+    try:
+        data = client.read(args.path)
+        if args.out:
+            with open(args.out, "wb") as f:
+                f.write(data)
+            print(f"[OK] Saved {len(data)} bytes to {args.out}")
+        elif args.text:
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
+        else:
+            print(f"[OK] Read {len(data)} bytes from {args.path}")
+            if len(data) <= 1024:
+                try:
+                    print(data.decode("utf-8"))
+                except UnicodeDecodeError:
+                    print(f"<binary data: {len(data)} bytes>")
+        return 0
+    except Exception as exc:
+        print(f"[ERROR] Failed to read '{args.path}': {exc}", file=sys.stderr)
+        return 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="ram-io-spooler management CLI")
     subparsers = parser.add_subparsers(dest="command")
 
     # server
-    subparsers.add_parser("server", help="Start the spooler daemon in foreground")
+    p_server = subparsers.add_parser("server", help="Start the spooler daemon in foreground")
+    p_server.add_argument("--read-cache-size", "-rc", default=None, help="RAM Read Cache max size (e.g. 1GB, 512MB, 2G). Default: 1GB or SPOOLER_READ_CACHE_SIZE env")
+    p_server.add_argument("--write-buffer-size", "-wb", default=None, help="RAM Transit Write Buffer max size (e.g. 512MB, 1GB). Default: 512MB or SPOOLER_WRITE_BUFFER_SIZE env")
 
     # status
     subparsers.add_parser("status", help="Get spooler status and metrics")
@@ -131,6 +156,12 @@ def main() -> int:
     p_write.add_argument("--file", "-f", help="File to read data from")
     p_write.add_argument("--append", "-a", action="store_true", help="Append instead of atomic replace")
 
+    # read
+    p_read = subparsers.add_parser("read", help="Read file via RAM Read Cache & Spooler")
+    p_read.add_argument("--path", "-p", required=True, help="Target file path on disk")
+    p_read.add_argument("--out", "-o", help="Optional path to save read content")
+    p_read.add_argument("--text", "-t", action="store_true", help="Print raw content to stdout")
+
     # history
     p_hist = subparsers.add_parser("history", help="Show recent task history")
     p_hist.add_argument("--limit", "-n", type=int, default=20, help="Number of records to show")
@@ -142,7 +173,11 @@ def main() -> int:
         return 1
 
     if args.command == "server":
-        asyncio.run(run_server())
+        cfg = SpoolerConfig(
+            read_cache_max_bytes=args.read_cache_size,
+            max_ram_bytes=args.write_buffer_size
+        )
+        run_server(cfg)
         return 0
 
     client = SpoolerClient()
@@ -151,6 +186,8 @@ def main() -> int:
         return cmd_status(client)
     elif args.command == "write":
         return cmd_write(client, args)
+    elif args.command == "read":
+        return cmd_read(client, args)
     elif args.command == "flush":
         return cmd_flush(client)
     elif args.command == "history":

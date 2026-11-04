@@ -408,3 +408,16 @@ class SpoolerServer:
 
     def read(self, target_path: str) -> Optional[bytes]:
         return self.read_file(target_path)
+
+
+def run_server(config: Optional[SpoolerConfig] = None) -> None:
+    """Run spooler server and block until interrupted."""
+    server = SpoolerServer(config or SpoolerConfig())
+    server.start()
+    try:
+        while True:
+            time.sleep(1)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        server.stop()

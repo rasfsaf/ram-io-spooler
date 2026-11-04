@@ -152,6 +152,46 @@ client.append(
 client.flush()
 ```
 
+### Buffer Size Tuning (Read Cache & Write Buffer)
+
+By default, **ram-io-spooler** allocates:
+- **RAM Read Cache**: `1 GB` (configurable via `read_cache_max_bytes` or `SPOOLER_READ_CACHE_SIZE`)
+- **RAM Transit Write Buffer**: `512 MB` (configurable via `max_ram_bytes` or `SPOOLER_WRITE_BUFFER_SIZE`)
+
+You can customize buffer sizes using human-readable strings (`"2GB"`, `"512MB"`, `"1.5G"`):
+
+**1. CLI Flags:**
+```bash
+python3 -m spooler server --read-cache-size 2GB --write-buffer-size 1GB
+```
+
+**2. Environment Variables:**
+```bash
+export SPOOLER_READ_CACHE_SIZE=2GB
+export SPOOLER_WRITE_BUFFER_SIZE=1GB
+python3 -m spooler server
+```
+
+**3. Python Code:**
+```python
+from spooler import SpoolerConfig, SpoolerServer
+
+# Pass human strings or integer byte counts
+config = SpoolerConfig(
+    read_cache_max_bytes="2GB",
+    max_ram_bytes="1GB"
+)
+server = SpoolerServer(config)
+```
+
+**4. Systemd Service:**
+```ini
+[Service]
+Environment="SPOOLER_READ_CACHE_SIZE=2GB"
+Environment="SPOOLER_WRITE_BUFFER_SIZE=1GB"
+ExecStart=/usr/bin/python3 -m spooler server --read-cache-size 2GB
+```
+
 ### 2. cURL / Microservices / Bash
 
 ```bash
@@ -275,6 +315,44 @@ client.sqlite_sync(
 
 # 5. Принудительный сброс очереди на физический диск
 client.flush()
+```
+
+### Настройка размеров буферов (ОЗУ)
+
+По умолчанию **ram-io-spooler** использует:
+- **Кэш чтения (LRU Read Cache)**: `1 ГБ` (параметр `read_cache_max_bytes` или переменная `SPOOLER_READ_CACHE_SIZE`)
+- **Транзитный буфер записи**: `512 МБ` (параметр `max_ram_bytes` или переменная `SPOOLER_WRITE_BUFFER_SIZE`)
+
+Поддерживаются удобные строковые форматы (`"2GB"`, `"512MB"`, `"1.5G"`, `"256M"`):
+
+**1. Аргументы командной строки (CLI):**
+```bash
+python3 -m spooler server --read-cache-size 2GB --write-buffer-size 1GB
+```
+
+**2. Переменные окружения:**
+```bash
+export SPOOLER_READ_CACHE_SIZE=2GB
+export SPOOLER_WRITE_BUFFER_SIZE=1GB
+python3 -m spooler server
+```
+
+**3. В Python коде:**
+```python
+from spooler import SpoolerConfig, SpoolerServer
+
+config = SpoolerConfig(
+    read_cache_max_bytes="2GB",
+    max_ram_bytes="1GB"
+)
+server = SpoolerServer(config)
+```
+
+**4. В службе Systemd (`/etc/systemd/system/ram-spooler.service`):**
+```ini
+[Service]
+Environment="SPOOLER_READ_CACHE_SIZE=2GB"
+Environment="SPOOLER_WRITE_BUFFER_SIZE=1GB"
 ```
 
 ### В Bash / cURL
