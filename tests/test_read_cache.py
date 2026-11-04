@@ -112,6 +112,44 @@ class TestReadYourOwnWrites(unittest.TestCase):
         self.assertEqual(res2["source"], "ram_cache")
         self.assertEqual(res2["text"], "content already on disk")
 
+    def test_read_during_in_flight_flush_race_condition(self):
+        """Verify that reading during drain_queue / in-flight flush never returns stale disk data."""
+        target = os.path.join(self.test_dir, "race_condition_test.txt")
+        # 1. Write v1 directly on disk
+        with open(target, "wb") as f:
+            f.write(b"v1_stale_content_on_disk")
+
+        # 2. Queue v2 via spooler
+        self.server._dispatch_command({
+            "cmd": "spool",
+            "target_path": target,
+            "data": b"v2_fresh_in_flight_content",
+            "op_type": "ATOMIC_WRITE"
+        })
+
+        # 3. Drain the queue (simulating PhysicalFlusher taking the batch)
+        batch = self.server.task_manager.drain_queue()
+        self.assertEqual(len(batch), 1)
+        self.assertEqual(len(self.server.task_manager.queue), 0, "Queue must be empty")
+        self.assertIn(batch[0].task_id, self.server.task_manager.in_flight_tasks, "Task must be tracked in in_flight_tasks")
+
+        # 4. Critical check: read_file() during in-flight window
+        # Disk still has v1_stale_content_on_disk, queue is empty!
+        # The fix must read v2_fresh_in_flight_content from in_flight_tasks in RAM
+        data, source = self.server.read_file(target)
+        self.assertEqual(source, "in_flight")
+        self.assertEqual(data, b"v2_fresh_in_flight_content")
+
+        # 5. Complete flush (simulate os.replace and record_completed)
+        with open(target, "wb") as f:
+            f.write(b"v2_fresh_in_flight_content")
+        self.server.task_manager.record_completed(batch[0])
+        self.assertEqual(len(self.server.task_manager.in_flight_tasks), 0)
+
+        # 6. Read again -> reads from disk (or cache) and has v2
+        data2, source2 = self.server.read_file(target)
+        self.assertEqual(data2, b"v2_fresh_in_flight_content")
+
 
 if __name__ == "__main__":
     unittest.main()

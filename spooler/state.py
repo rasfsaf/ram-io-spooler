@@ -25,6 +25,8 @@ class TaskStatus(str, Enum):
     COALESCED = "COALESCED"
     FLUSHING = "FLUSHING"
     SYNCED = "SYNCED"
+    COMPLETED = "SYNCED"
+    DONE = "SYNCED"
     EVICTED = "EVICTED"
     FAILED = "FAILED"
 
@@ -52,6 +54,30 @@ class SpoolTask:
     @property
     def state(self) -> TaskStatus:
         return self.status
+
+    @state.setter
+    def state(self, value: TaskStatus) -> None:
+        self.status = value
+
+    @property
+    def error(self) -> Optional[str]:
+        return self.error_message
+
+    @error.setter
+    def error(self, value: Optional[str]) -> None:
+        self.error_message = value
+
+    @property
+    def retries(self) -> int:
+        return getattr(self, "_retries", 0)
+
+    @retries.setter
+    def retries(self, value: int) -> None:
+        self._retries = value
+
+    @property
+    def max_retries(self) -> int:
+        return getattr(self, "_max_retries", 3)
 
     def to_dict(self) -> dict:
         return {
@@ -84,6 +110,14 @@ class SpoolerMetrics:
     total_bytes_written_to_disk: int = 0
     staging_bytes_current: int = 0
 
+    @property
+    def total_bytes_flushed(self) -> int:
+        return self.total_bytes_written_to_disk
+
+    @total_bytes_flushed.setter
+    def total_bytes_flushed(self, value: int) -> None:
+        self.total_bytes_written_to_disk = value
+
 
 class TaskManager:
     """Manages active queues, state transitions, and completed task history."""
@@ -100,6 +134,7 @@ class TaskManager:
             self.config = None
 
         self.queue: List[SpoolTask] = []
+        self.in_flight_tasks: Dict[str, SpoolTask] = {}
         self.history: Deque[SpoolTask] = deque(maxlen=self.history_limit)
         self.metrics = SpoolerMetrics()
         self.tasks_by_id: Dict[str, SpoolTask] = {}
@@ -161,14 +196,30 @@ class TaskManager:
         return task
 
     def add_task(self, task: SpoolTask) -> None:
-        self.queue.append(task)
-        self.tasks_by_id[task.task_id] = task
-        self.metrics.total_queued += 1
-        self.metrics.total_bytes_received += task.byte_size
-        self.metrics.staging_bytes_current += task.byte_size
+        with self.lock:
+            self.queue.append(task)
+            self.tasks_by_id[task.task_id] = task
+            self.metrics.total_queued += 1
+            self.metrics.total_bytes_received += task.byte_size
+            self.metrics.staging_bytes_current += task.byte_size
 
     def get_task(self, task_id: str) -> Optional[SpoolTask]:
-        return self.tasks_by_id.get(task_id)
+        with self.lock:
+            return self.tasks_by_id.get(task_id)
+
+    def fail_task(self, task_id: str, error: str = "", retryable: bool = True) -> None:
+        """Mark task as failed or return it to queue if retryable."""
+        with self.lock:
+            task = self.in_flight_tasks.pop(task_id, None) or self.tasks_by_id.get(task_id)
+            if task:
+                task.last_error = error
+                if retryable and task.retry_count < 3:
+                    task.retry_count += 1
+                    task.state = SpoolState.QUEUED
+                    self.queue.append(task)
+                else:
+                    task.state = SpoolState.FAILED
+                    task.completed_at = time.time()
 
     def get_pending_data(self, target_path: str) -> Optional[bytes]:
         """
@@ -177,10 +228,22 @@ class TaskManager:
         Returns the resolved bytes if pending data exists, or None.
         """
         norm_target = os.path.abspath(target_path)
-        matching_tasks = [
-            t for t in self.queue
-            if os.path.abspath(t.target_path) == norm_target and t.state in (SpoolState.QUEUED, SpoolState.COALESCED, SpoolState.FLUSHING)
-        ]
+        with self.lock:
+            # Match tasks in active in-flight flush AND queued for this exact target path
+            in_flight = [
+                t for t in self.in_flight_tasks.values()
+                if os.path.abspath(t.target_path) == norm_target and t.state == SpoolState.FLUSHING
+            ]
+            in_flight.sort(key=lambda t: t.created_at)
+
+            queued = [
+                t for t in self.queue
+                if os.path.abspath(t.target_path) == norm_target and t.state in (SpoolState.QUEUED, SpoolState.COALESCED)
+            ]
+            queued.sort(key=lambda t: t.created_at)
+
+            matching_tasks = in_flight + queued
+
         if not matching_tasks:
             return None
 
@@ -238,14 +301,18 @@ class TaskManager:
             return list({t.target_path for t in self.queue})
 
     def drain_queue(self, max_items: Optional[int] = None) -> List[SpoolTask]:
-        """Extract queued tasks for a flush cycle."""
+        """Extract queued tasks for a flush cycle and register them as in-flight."""
         with self.lock:
             if max_items is None or max_items >= len(self.queue):
                 batch = self.queue
                 self.queue = []
-                return batch
-            batch = self.queue[:max_items]
-            self.queue = self.queue[max_items:]
+            else:
+                batch = self.queue[:max_items]
+                self.queue = self.queue[max_items:]
+
+            for task in batch:
+                task.state = SpoolState.FLUSHING
+                self.in_flight_tasks[task.task_id] = task
             return batch
 
     def extract_queue(self) -> List[SpoolTask]:
@@ -254,15 +321,27 @@ class TaskManager:
 
     def requeue_tasks(self, tasks: List[SpoolTask]) -> None:
         """Put back tasks that failed or could not be processed immediately."""
-        self.queue = tasks + self.queue
+        with self.lock:
+            for task in tasks:
+                self.in_flight_tasks.pop(task.task_id, None)
+                task.state = SpoolState.QUEUED
+            self.queue = tasks + self.queue
 
     def record_completed(self, task: SpoolTask) -> None:
-        self.history.append(task)
-        if len(self.tasks_by_id) > self.history_limit * 2:
-            current_active = {t.task_id for t in self.queue}
-            history_ids = {t.task_id for t in self.history}
-            valid_ids = current_active | history_ids
-            self.tasks_by_id = {k: v for k, v in self.tasks_by_id.items() if k in valid_ids}
+        with self.lock:
+            self.in_flight_tasks.pop(task.task_id, None)
+            if task.status != TaskStatus.EVICTED:
+                task.status = TaskStatus.SYNCED
+            task.completed_at = time.time()
+            self.metrics.total_flushed += 1
+            self.metrics.total_bytes_flushed += task.byte_size
+            self.metrics.staging_bytes_current = max(0, self.metrics.staging_bytes_current - task.byte_size)
+            self.history.append(task)
+            if len(self.tasks_by_id) > self.history_limit * 2:
+                current_active = {t.task_id for t in self.queue} | set(self.in_flight_tasks.keys())
+                history_ids = {t.task_id for t in self.history}
+                valid_ids = current_active | history_ids
+                self.tasks_by_id = {k: v for k, v in self.tasks_by_id.items() if k in valid_ids}
 
     def get_metrics_dict(self) -> Dict[str, Any]:
         """Return metrics as a dictionary for status inspection."""
@@ -271,5 +350,7 @@ class TaskManager:
     def get_stats(self) -> Dict[str, Any]:
         """Return metrics and current queue size for status inspection."""
         stats = self.get_metrics_dict()
-        stats["pending_tasks"] = len(self.queue)
+        with self.lock:
+            stats["pending_tasks"] = len(self.queue)
+            stats["in_flight_tasks"] = len(self.in_flight_tasks)
         return stats

@@ -164,10 +164,16 @@ class SpoolerServer:
         """
         norm_path = os.path.normpath(os.path.abspath(target_path))
 
-        # 1. Read-Your-Own-Writes: check pending RAM queue
+        # 1. Read-Your-Own-Writes: check pending RAM buffer (queue or in-flight flush)
         pending_data = self.task_manager.get_pending_data(norm_path)
         if pending_data is not None:
-            return pending_data, "queue"
+            with self.task_manager.lock:
+                is_in_flight = any(
+                    os.path.abspath(t.target_path) == norm_path
+                    for t in self.task_manager.in_flight_tasks.values()
+                )
+            source = "in_flight" if is_in_flight else "queue"
+            return pending_data, source
 
         # 2. Check RAM Read Cache
         if self.read_cache:
@@ -220,10 +226,14 @@ class SpoolerServer:
             self._run_unix_listener()
 
     def _run_unix_listener(self) -> None:
-        socket_path = self.config.ipc_socket_path
+        raw_path = str(self.config.ipc_socket_path or self.config.socket_path)
+        socket_path = os.path.normpath(raw_path)
         socket_dir = os.path.dirname(socket_path)
         if socket_dir and not os.path.exists(socket_dir):
-            os.makedirs(socket_dir, exist_ok=True)
+            try:
+                os.makedirs(socket_dir, exist_ok=True)
+            except Exception as e:
+                logger.warning(f"Could not create socket dir {socket_dir}: {e}")
 
         if os.path.exists(socket_path):
             try:
@@ -231,9 +241,37 @@ class SpoolerServer:
             except OSError:
                 pass
 
-        self._server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._server_sock.bind(socket_path)
-        os.chmod(socket_path, 0o666)
+        try:
+            self._server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._server_sock.bind(socket_path)
+        except OSError as e:
+            logger.warning(f"Failed to bind socket at {socket_path} ({e}), falling back to /dev/shm/ram-spooler.sock")
+            socket_path = "/dev/shm/ram-spooler.sock"
+            if os.path.exists(socket_path):
+                try:
+                    os.remove(socket_path)
+                except OSError:
+                    pass
+            self._server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._server_sock.bind(socket_path)
+
+        try:
+            os.chmod(socket_path, 0o666)
+        except Exception:
+            pass
+
+        # Try creating convenience symlink at /run/ram-spooler.sock if running elsewhere
+        if socket_path != "/run/ram-spooler.sock":
+            try:
+                if os.path.islink("/run/ram-spooler.sock") or os.path.exists("/run/ram-spooler.sock"):
+                    try:
+                        os.unlink("/run/ram-spooler.sock")
+                    except OSError:
+                        pass
+                os.symlink(socket_path, "/run/ram-spooler.sock")
+            except Exception:
+                pass
+
         self._server_sock.listen(128)
         self._server_sock.settimeout(1.0)
         logger.info("IPC Unix socket listening on %s", socket_path)
